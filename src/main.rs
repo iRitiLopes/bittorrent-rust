@@ -1,4 +1,4 @@
-use serde_json;
+use serde_json::{self};
 use std::{env};
 
 // Available if you need it!
@@ -24,7 +24,7 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
             "i" => number_string.parse::<i32>().unwrap(),
             _ => panic!("Not implemented type")
         };
-        return serde_json::Value::String(value.to_string());
+        return serde_json::Value::Number(value.into());
     }
 }
 
