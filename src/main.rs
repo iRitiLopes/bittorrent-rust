@@ -20,8 +20,8 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
         let number_string = &encoded_value[1..encoded_value.len() - 1];
         //let extension_char = &encoded_value[encoded_value.len() - 1..];
 
-        let value: i32 = match char_type {
-            "i" => number_string.parse::<i32>().unwrap(),
+        let value: i64 = match char_type {
+            "i" => number_string.parse::<i64>().unwrap(),
             _ => panic!("Not implemented type")
         };
         return serde_json::Value::Number(value.into());
