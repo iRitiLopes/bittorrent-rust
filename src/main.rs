@@ -16,15 +16,29 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
         return serde_json::Value::String(string.to_string());
     } else {
         // Example: "i43e" -> 43
-        let char_type = &encoded_value[0..1];
+        let first_char = &encoded_value[0..1];
         let number_string = &encoded_value[1..encoded_value.len() - 1];
-        //let extension_char = &encoded_value[encoded_value.len() - 1..];
+        let last_char = &encoded_value[encoded_value.len() - 1..];
 
-        let value: i64 = match char_type {
-            "i" => number_string.parse::<i64>().unwrap(),
+        return match (first_char, last_char) {
+            ("i", "e") => serde_json::Value::Number(number_string.parse::<i64>().unwrap().into()),
+            ("l", "e") => {
+                let mut pivot = 1;
+                let mut values = Vec::<serde_json::Value>::new();
+                while pivot < encoded_value.len() - 1 {
+                    let value = decode_bencoded_value(&encoded_value[pivot..encoded_value.len() - 1]);
+                    if value.is_string() {
+                        pivot = pivot + value.as_str().unwrap().len() + 2
+                    }
+                    if value.is_i64() {
+                        pivot = pivot + 2 + value.as_i64().unwrap().to_string().len()
+                    }
+                    values.push(value);
+                }
+                serde_json::Value::Array(values)
+            }
             _ => panic!("Not implemented type")
         };
-        return serde_json::Value::Number(value.into());
     }
 }
 
