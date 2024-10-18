@@ -1,5 +1,5 @@
 use serde_json;
-use std::{default, env};
+use std::{env};
 
 // Available if you need it!
 // use serde_bencode
@@ -18,7 +18,7 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
         // Example: "i43e" -> 43
         let char_type = &encoded_value[0..1];
         let number_string = &encoded_value[1..encoded_value.len() - 1];
-        let extension_char = &encoded_value[encoded_value.len() - 1..];
+        //let extension_char = &encoded_value[encoded_value.len() - 1..];
 
         let value: i32 = match char_type {
             "i" => number_string.parse::<i32>().unwrap(),
