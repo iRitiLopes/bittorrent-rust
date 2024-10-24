@@ -6,6 +6,7 @@ use std::{env, ops::Add};
 
 #[allow(dead_code)]
 fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
+    println!("{}", encoded_value);
     // If encoded_value starts with a digit, it's a number
     if encoded_value.chars().next().unwrap().is_digit(10) {
         // Example: "5:hello" -> "hello"
@@ -30,11 +31,14 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
             "l" => {
                 let mut values = Vec::<serde_json::Value>::new();
                 let mut pivot = 1;
+                let mut end_pivot = encoded_value.len() - 1;
 
-                while pivot < encoded_value.len() - 1 {
-                    let all_values = &encoded_value[pivot..encoded_value.len() - 1];
+                while pivot < end_pivot {
+                    let all_values = &encoded_value[pivot..end_pivot];
                     let decoded_value = decode_bencoded_value(all_values);
-                    pivot = pivot + find_pivot(decoded_value.clone());
+                    let (aux_pivot, aux_end_pivot) = find_pivot(decoded_value.clone());
+                    pivot = pivot + aux_pivot;
+                    end_pivot = end_pivot - aux_end_pivot;
                     values.push(decoded_value);
                 }
 
@@ -45,16 +49,41 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
     }
 }
 
-fn find_pivot(v: serde_json::Value) -> usize {
+fn find_pivot(v: serde_json::Value) -> (usize, usize) {
     if v.is_string() {
-        return v.as_str().unwrap().len().add(2);
+        return (v.as_str().unwrap().len().add(2), 0);
     }
 
     if v.is_i64() {
-        return v.as_i64().map(|x| x.to_string()).unwrap().len().add(2);
+        return (v.as_i64().map(|x| x.to_string()).unwrap().len().add(2), 0);
     }
 
-    0
+    if v.is_array() {
+        let a = v.as_array().map(|a| {
+            let b = a
+                .iter()
+                .map(|x| {
+                    let z = find_pivot(x.clone());
+                    z
+                })
+                .collect::<Vec<(usize, usize)>>();
+            if b.len() == 0 {
+                return (1, 1)
+            }
+            println!("DEBUG - {:?} - b {:?}", v, b);
+            let mut aux_a = 0;
+            let mut aux_b = 0;
+            for ele in b {
+                aux_a += ele.0 + 1;
+                aux_b += ele.1 + 1;
+            }
+            (aux_a, aux_b)
+        });
+        println!("DEBUG - {:?}", a);
+        return a.unwrap();
+    }
+
+    (0, 0)
 }
 
 // Usage: your_bittorrent.sh decode "<encoded_value>"
