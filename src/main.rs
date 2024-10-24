@@ -70,7 +70,7 @@ fn find_pivot(v: serde_json::Value) -> (usize, usize) {
             if b.len() == 0 {
                 return (1, 1)
             }
-            println!("DEBUG - {:?} - b {:?}", v, b);
+            //println!("DEBUG - {:?} - b {:?}", v, b);
             let mut aux_a = 0;
             let mut aux_b = 0;
             for ele in b {
@@ -79,7 +79,7 @@ fn find_pivot(v: serde_json::Value) -> (usize, usize) {
             }
             (aux_a, aux_b)
         });
-        println!("DEBUG - {:?}", a);
+        //println!("DEBUG - {:?}", a);
         return a.unwrap();
     }
 
