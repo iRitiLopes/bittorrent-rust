@@ -31,13 +31,12 @@ fn convert(value: serde_bencode::value::Value) -> anyhow::Result<serde_json::Val
         }
         serde_bencode::value::Value::Dict(d) => {
             let mut dict = serde_json::Map::new();
-            let hm = d.into_iter()
-            .map(|(k,v)| {
+            d.into_iter()
+            .for_each(|(k,v)| {
                 let key = String::from_utf8(k).unwrap();
                 let value = convert(v).unwrap();
                 dict.insert(key, value);
             });
-
             Ok(serde_json::Value::Object(dict))
         }
         _ => {
