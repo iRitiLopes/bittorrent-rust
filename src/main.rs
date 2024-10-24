@@ -1,5 +1,7 @@
+use std::{collections::HashMap, hash::Hash};
+
+use anyhow::Ok;
 use serde_json::{self};
-use std::{any::Any, default, env, io};
 
 // Available if you need it!
 // use serde_bencode
@@ -26,6 +28,17 @@ fn convert(value: serde_bencode::value::Value) -> anyhow::Result<serde_json::Val
                 .map(|item| convert(item))
                 .collect::<anyhow::Result<Vec<serde_json::Value>>>()?;
             Ok(serde_json::Value::Array(array))
+        }
+        serde_bencode::value::Value::Dict(d) => {
+            let mut dict = serde_json::Map::new();
+            let hm = d.into_iter()
+            .map(|(k,v)| {
+                let key = String::from_utf8(k).unwrap();
+                let value = convert(v).unwrap();
+                dict.insert(key, value);
+            });
+
+            Ok(serde_json::Value::Object(dict))
         }
         _ => {
             panic!("Unhandled encoded value: {:?}", value)
