@@ -6,6 +6,7 @@ use std::{env, ops::Add};
 
 #[allow(dead_code)]
 fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
+    //println!("{}", encoded_value);
     // If encoded_value starts with a digit, it's a number
     if encoded_value.chars().next().unwrap().is_digit(10) {
         // Example: "5:hello" -> "hello"
@@ -50,7 +51,9 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
 
 fn find_pivot(v: serde_json::Value) -> (usize, usize) {
     if v.is_string() {
-        return (v.as_str().unwrap().len().add(2), 0);
+        //println!("DEBUG - v: {:?}",v);
+        let digit_size = v.as_str().unwrap().len();
+        return (v.as_str().unwrap().len().add(1 + digit_size), 0);
     }
 
     if v.is_i64() {
