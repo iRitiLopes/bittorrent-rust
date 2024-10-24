@@ -51,8 +51,9 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
 
 fn find_pivot(v: serde_json::Value) -> (usize, usize) {
     if v.is_string() {
-        //println!("DEBUG - v: {:?}",v);
-        let digit_size = v.as_str().unwrap().len();
+        let str_size = v.as_str().unwrap().len();
+        let digit_size = str_size.to_string().len();
+        //println!("DEBUG - v: {:?} - size {}",v, str_size + digit_size);
         return (v.as_str().unwrap().len().add(1 + digit_size), 0);
     }
 
