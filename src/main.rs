@@ -1,5 +1,5 @@
 use serde_json::{self};
-use std::{env};
+use std::{env, ops::Add};
 
 // Available if you need it!
 // use serde_bencode
@@ -17,29 +17,44 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
     } else {
         // Example: "i43e" -> 43
         let first_char = &encoded_value[0..1];
-        let number_string = &encoded_value[1..encoded_value.len() - 1];
-        let last_char = &encoded_value[encoded_value.len() - 1..];
 
-        return match (first_char, last_char) {
-            ("i", "e") => serde_json::Value::Number(number_string.parse::<i64>().unwrap().into()),
-            ("l", "e") => {
-                let mut pivot = 1;
-                let mut values = Vec::<serde_json::Value>::new();
-                while pivot < encoded_value.len() - 1 {
-                    let value = decode_bencoded_value(&encoded_value[pivot..encoded_value.len() - 1]);
-                    if value.is_string() {
-                        pivot = pivot + value.as_str().unwrap().len() + 2
-                    }
-                    if value.is_i64() {
-                        pivot = pivot + 2 + value.as_i64().unwrap().to_string().len()
-                    }
-                    values.push(value);
+        return match first_char {
+            "i" => {
+                let last_char = &encoded_value.find("e");
+                if last_char.is_none() {
+                    panic!("Need e");
                 }
+                let number_string = &encoded_value[1..last_char.unwrap()];
+                serde_json::Value::Number(number_string.parse::<i64>().unwrap().into())
+            }
+            "l" => {
+                let mut values = Vec::<serde_json::Value>::new();
+                let mut pivot = 1;
+
+                while pivot < encoded_value.len() - 1 {
+                    let all_values = &encoded_value[pivot..encoded_value.len() - 1];
+                    let decoded_value = decode_bencoded_value(all_values);
+                    pivot = pivot + find_pivot(decoded_value.clone());
+                    values.push(decoded_value);
+                }
+
                 serde_json::Value::Array(values)
             }
-            _ => panic!("Not implemented type")
+            _ => panic!("Not implemented type"),
         };
     }
+}
+
+fn find_pivot(v: serde_json::Value) -> usize {
+    if v.is_string() {
+        return v.as_str().unwrap().len().add(2);
+    }
+
+    if v.is_i64() {
+        return v.as_i64().map(|x| x.to_string()).unwrap().len().add(2);
+    }
+
+    0
 }
 
 // Usage: your_bittorrent.sh decode "<encoded_value>"
