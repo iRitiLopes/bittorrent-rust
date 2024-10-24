@@ -6,7 +6,6 @@ use std::{env, ops::Add};
 
 #[allow(dead_code)]
 fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
-    println!("{}", encoded_value);
     // If encoded_value starts with a digit, it's a number
     if encoded_value.chars().next().unwrap().is_digit(10) {
         // Example: "5:hello" -> "hello"
