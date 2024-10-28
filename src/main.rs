@@ -1,10 +1,10 @@
 use anyhow::Context;
-use clap::{self, command, Arg, Parser, Subcommand};
+use clap::{self, command, Parser, Subcommand};
 use core::str;
 use hashes::Hashes;
 use serde::Deserialize;
 use serde_json::{self};
-use std::{env, io::Read, path::PathBuf, vec};
+use std::{path::PathBuf};
 // Available if you need it!
 // use serde_bencode
 
@@ -16,18 +16,21 @@ struct Args {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(dead_code)]
 enum Command {
     Decode { value: String },
     Info { torrent: PathBuf },
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct Torrent {
     announce: String,
     info: Info,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct Info {
     name: String,
 
@@ -41,6 +44,7 @@ struct Info {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 #[serde(untagged)]
 enum Keys {
     SingleFile { length: usize },
@@ -48,6 +52,7 @@ enum Keys {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct File {
     length: usize,
     path: Vec<String>,
@@ -118,6 +123,7 @@ fn main() {
     match args.command {
         Command::Decode { value } => {
             let decoded = decode(&value).0;
+            println!("{}", decoded.to_string())
         }
         Command::Info { torrent } => {
             let torrent_file = std::fs::read(torrent).unwrap();
