@@ -1,10 +1,12 @@
 use anyhow::Context;
 use clap::{self, command, Parser, Subcommand};
-use core::str;
+use ::hashes::sha1;
+use ::sha1::{Sha1, Digest};
+use core::{hash, str};
 use hashes::Hashes;
 use serde::Deserialize;
-use serde_json::{self};
-use std::{path::PathBuf};
+use serde_json::{self, to_vec};
+use std::{hash::{DefaultHasher, Hash, Hasher}, path::PathBuf};
 // Available if you need it!
 // use serde_bencode
 
@@ -130,11 +132,29 @@ fn main() {
             let t: Torrent = serde_bencode::from_bytes(&torrent_file).context("a").unwrap();
             println!("Tracker URL: {}", t.announce);
 
-            if let Keys::SingleFile { length } = t.info.keys {
-                println!("Length: {length}");
-            } else {
-                todo!()
+            let mut hasher = Sha1::new();
+            match t.info.keys {
+                Keys::SingleFile { length } => {
+                    hasher.update(length.to_string());
+                    println!("Length: {length}");
+                },
+                Keys::MultiFile { files } => {
+                    for ele in files {
+                        hasher.update(ele.length.to_string());
+                        for p in ele.path {
+                            hasher.update(p);
+                        }
+                    }
+                },
+            };
+            hasher.update(t.info.name);
+            for ele in t.info.pieces.0 {
+                hasher.update(ele);
             }
+            hasher.update(t.info.plength.to_string());
+            //hasher.update(name.clone());
+            let digest = hasher.finalize();
+            println!("Info Hash: {digest:x}");
         }
     }
 }
@@ -145,11 +165,19 @@ mod hashes {
 
     use std::fmt;
 
+    use ::hashes::sha1;
+
     #[derive(Debug, Clone)]
 
     pub struct Hashes(pub Vec<[u8; 20]>);
 
     struct HashesVisitor;
+
+    impl Hashes {
+        // fn to_sha1(&self) {
+        //     return sha1::hash(self.0.to_vec());
+        // }
+    }
 
     impl<'de> Visitor<'de> for HashesVisitor {
         type Value = Hashes;
