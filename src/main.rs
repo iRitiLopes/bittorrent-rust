@@ -4,7 +4,7 @@ use ::hashes::sha1;
 use ::sha1::{Sha1, Digest};
 use core::{hash, str};
 use hashes::Hashes;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{self, to_vec};
 use std::{hash::{DefaultHasher, Hash, Hasher}, path::PathBuf};
 // Available if you need it!
@@ -24,14 +24,14 @@ enum Command {
     Info { torrent: PathBuf },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 struct Torrent {
     announce: String,
     info: Info,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 struct Info {
     name: String,
@@ -45,7 +45,7 @@ struct Info {
     keys: Keys,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 #[serde(untagged)]
 enum Keys {
@@ -53,7 +53,7 @@ enum Keys {
     MultiFile { files: Vec<File> },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 struct File {
     length: usize,
@@ -131,28 +131,17 @@ fn main() {
             let torrent_file = std::fs::read(torrent).unwrap();
             let t: Torrent = serde_bencode::from_bytes(&torrent_file).context("a").unwrap();
             println!("Tracker URL: {}", t.announce);
-
-            let mut hasher = Sha1::new();
             match t.info.keys {
                 Keys::SingleFile { length } => {
-                    hasher.update(length.to_string());
                     println!("Length: {length}");
                 },
                 Keys::MultiFile { files } => {
-                    for ele in files {
-                        hasher.update(ele.length.to_string());
-                        for p in ele.path {
-                            hasher.update(p);
-                        }
-                    }
+                    todo!()
                 },
             };
-            hasher.update(t.info.name);
-            for ele in t.info.pieces.0 {
-                hasher.update(ele);
-            }
-            hasher.update(t.info.plength.to_string());
-            //hasher.update(name.clone());
+            let mut hasher = Sha1::new();
+            let info_encoded = serde_bencode::to_bytes(&t.info).expect("Reencoding");
+            hasher.update(&info_encoded);
             let digest = hasher.finalize();
             println!("Info Hash: {digest:x}");
         }
@@ -161,11 +150,9 @@ fn main() {
 
 mod hashes {
 
-    use serde::de::{self, Deserialize, Deserializer, Visitor};
+    use serde::{de::{self, Deserialize, Deserializer, Visitor}, ser::{self, Serialize, Serializer}};
 
     use std::fmt;
-
-    use ::hashes::sha1;
 
     #[derive(Debug, Clone)]
 
@@ -210,6 +197,17 @@ mod hashes {
             D: Deserializer<'de>,
         {
             deserializer.deserialize_bytes(HashesVisitor)
+        }
+    }
+
+
+    impl Serialize for Hashes {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let single_slice = self.0.concat();
+            serializer.serialize_bytes(&single_slice)
         }
     }
 }
