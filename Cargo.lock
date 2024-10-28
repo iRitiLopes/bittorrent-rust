@@ -127,6 +127,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "hashes",
  "hex",
  "regex",
  "reqwest",
@@ -423,6 +424,12 @@ name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
+
+[[package]]
+name = "hashes"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ae25ccbcba51b77f4ffd55cd0221c84e0e2958a13669d97775ccd43ce6f2873"
 
 [[package]]
 name = "heck"
