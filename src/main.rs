@@ -55,7 +55,6 @@ struct File {
 
 #[allow(dead_code)]
 fn decode(encoded_value: &str) -> (serde_json::Value, &str) {
-    println!("{}", encoded_value);
     match encoded_value.chars().next() {
         Some('i') => {
             if let Some((n, rest)) =
@@ -119,7 +118,6 @@ fn main() {
     match args.command {
         Command::Decode { value } => {
             let decoded = decode(&value).0;
-            println!("{decoded}")
         }
         Command::Info { torrent } => {
             let torrent_file = std::fs::read(torrent).unwrap();
