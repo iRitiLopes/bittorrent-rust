@@ -144,6 +144,12 @@ fn main() {
             hasher.update(&info_encoded);
             let digest = hasher.finalize();
             println!("Info Hash: {digest:x}");
+            println!("Piece Length: {}", t.info.plength);
+            println!("Piece Hashes:");
+            for ele in t.info.pieces.0 {
+                println!("{}", hex::encode(&ele));
+
+            }
         }
     }
 }
