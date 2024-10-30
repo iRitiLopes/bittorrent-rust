@@ -200,7 +200,7 @@ async fn main() -> Result<(), Error> {
             let tracker_response: TrackerResponse =
                 serde_bencode::from_bytes(&response).context("Parsing tracker response")?;
             for peer in tracker_response.peers.0 {
-                println!("{} {}", peer.ip(), peer.port())
+                println!("{}:{}", peer.ip(), peer.port())
             }
             Ok(())
         }
