@@ -4,10 +4,9 @@ use clap::{self, command, Parser, Subcommand};
 use core::str;
 use hashes::Hashes;
 use peers::Peers;
-use reqwest::{Method, Request, Url};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use serde_json::{self, to_vec};
-use sha1::{digest::core_api::CoreWrapper, Sha1Core};
+use serde_json::{self};
 use std::path::PathBuf;
 // Available if you need it!
 // use serde_bencode
@@ -164,7 +163,7 @@ async fn main() -> Result<(), Error> {
                 Keys::SingleFile { length } => {
                     println!("Length: {length}");
                 }
-                Keys::MultiFile { files } => {
+                Keys::MultiFile { files: _ } => {
                     todo!()
                 }
             };
@@ -223,7 +222,6 @@ fn parse_torrent(path: PathBuf) -> Result<Torrent, Error> {
 }
 
 mod peers {
-    use anyhow::Ok;
     use serde::de::{self, Deserialize, Deserializer, Visitor};
 
     use serde::ser::{Serialize, Serializer};
@@ -291,7 +289,7 @@ mod hashes {
 
     use serde::{
         de::{self, Deserialize, Deserializer, Visitor},
-        ser::{self, Serialize, Serializer},
+        ser::{Serialize, Serializer},
     };
 
     use std::fmt;
