@@ -1,75 +1,26 @@
-use ::sha1::{Digest, Sha1};
+use bytes::{buf, BufMut, BytesMut};
+use cli::{Args, Command};
 use anyhow::{Context, Error, Ok};
-use clap::{self, command, Parser, Subcommand};
+use clap::{self, Parser};
+use tokio::{io::AsyncReadExt, stream, sync::Mutex};
+use torrent::{Keys, Torrent};
+use transport::Transport;
 use core::str;
-use hashes::Hashes;
 use peers::Peers;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{self};
-use std::path::PathBuf;
+use std::{io, path::PathBuf, sync::Arc, time::Duration};
+use tokio::net::TcpStream;
 // Available if you need it!
 // use serde_bencode
 
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    #[command(subcommand)]
-    command: Command,
-}
+mod cli;
+mod torrent;
+mod hs;
+mod peers;
+mod transport;
 
-#[derive(Subcommand, Debug)]
-#[allow(dead_code)]
-enum Command {
-    Decode { value: String },
-    Info { torrent: PathBuf },
-    Peers { torrent: PathBuf },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[allow(dead_code)]
-struct Torrent {
-    announce: String,
-    info: Info,
-}
-
-impl Torrent {
-    fn info_hash(&self) -> [u8; 20] {
-        let mut hasher = Sha1::new();
-        let info_encoded = serde_bencode::to_bytes(&self.info).expect("Reencoding");
-        hasher.update(&info_encoded);
-        return hasher.finalize().try_into().expect("Generating");
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[allow(dead_code)]
-struct Info {
-    name: String,
-
-    #[serde(rename = "piece length")]
-    plength: usize,
-
-    pieces: Hashes,
-
-    #[serde(flatten)]
-    keys: Keys,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[allow(dead_code)]
-#[serde(untagged)]
-enum Keys {
-    SingleFile { length: usize },
-    MultiFile { files: Vec<File> },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[allow(dead_code)]
-struct File {
-    length: usize,
-    path: Vec<String>,
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrackerRequest {
@@ -85,6 +36,181 @@ pub struct TrackerRequest {
 pub struct TrackerResponse {
     pub interval: usize,
     pub peers: Peers,
+}
+
+struct TorrentClient {
+    pub torrent: Torrent
+}
+
+const DEFAULT_PROTOCOL_ID: &str = "BitTorrent protocol";
+pub const SHA1_HASH_BYTE_LENGTH: usize = 20;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HandshakeMessage {
+    peer_id: String,
+    info_hash: [u8; 20],
+    protocol_id: String,
+}
+
+impl From<HandshakeMessage> for BytesMut {
+    fn from(msg: HandshakeMessage) -> Self {
+        let mut result = BytesMut::new();
+        result.put_u8(msg.protocol_id.len() as u8);
+        result.put_slice(msg.protocol_id.as_bytes());
+        result.put_slice(&[0; 8]);
+        result.put_slice(msg.info_hash.as_slice());
+        result.put_slice(msg.peer_id.as_bytes());
+        result
+    }
+}
+
+impl TryFrom<Vec<u8>> for HandshakeMessage {
+    type Error = Error;
+    fn try_from(raw: Vec<u8>) -> Result<Self, Self::Error> {
+        let protocol_id_length = raw.first().expect("Missing");
+        let protocol_id_length = *protocol_id_length as usize;
+        let message_size = protocol_id_length + 49; // from https://wiki.theory.org/BitTorrentSpecification#Handshake
+        if raw.len() < message_size {
+            return Err(Error::msg("Failed"));
+        }
+        let message = &raw[1..message_size];
+        let protocol_id = &message[0..protocol_id_length];
+        let info_hash: [u8; SHA1_HASH_BYTE_LENGTH] = message
+            [protocol_id_length + 8..protocol_id_length + SHA1_HASH_BYTE_LENGTH + 8]
+            .try_into()
+            .map_err(|_| Error::msg("Failed"))?;
+        let peer_id = &message[protocol_id_length + SHA1_HASH_BYTE_LENGTH + 8..];
+        Ok(Self::new(
+            String::from_utf8_lossy(peer_id).to_string(),
+            info_hash,
+            Some(String::from_utf8_lossy(protocol_id).to_string()),
+        ))
+    }
+}
+
+pub struct PeerConnection<S>
+where
+    S: Transport,
+{
+    stream: Arc<Mutex<S>>,
+    io_timeout: Duration,
+}
+
+impl<T: Transport> PeerConnection<T> {
+    pub fn new(stream: T, io_timeout: Duration) -> Self {
+        Self {
+            stream: Arc::new(Mutex::new(stream)),
+            io_timeout,
+        }
+    }
+}
+
+impl HandshakeMessage {
+    pub fn new(peer_id: String, info_hash: [u8; 20], protocol_id: Option<String>) -> Self {
+        let mut protocol_id_final = DEFAULT_PROTOCOL_ID.to_string();
+        if let Some(proto_id) = protocol_id {
+            protocol_id_final = proto_id;
+        }
+        Self {
+            peer_id,
+            info_hash,
+            protocol_id: protocol_id_final,
+        }
+    }
+}
+
+impl TorrentClient {
+    pub async fn peers(self) -> Result<Peers, Error> {
+        let hash_info_encoded = self.torrent.url_encoded();
+
+        let tracker_request = TrackerRequest {
+            peer_id: String::from("00112233445566778899"),
+            port: 6881,
+            uploaded: 0,
+            downloaded: 0,
+            left: self.torrent.info.plength,
+            compact: 1,
+        };
+
+        let url_params = serde_urlencoded::to_string(&tracker_request).context("paramaters")?;
+        let tracker_url = format!(
+            "{}?{}&info_hash={}",
+            self.torrent.announce, url_params, hash_info_encoded
+        );
+        let url = Url::parse(&tracker_url).expect("Parsing URL");
+        let response = reqwest::get(url).await?.bytes().await?;
+        let tracker_response: TrackerResponse = serde_bencode::from_bytes(&response).context("Parsing tracker response")?;
+        Ok(tracker_response.peers)
+    }
+
+    pub async fn handshake(self) -> Result<(), Error> {
+        let info_hash = self.torrent.info_hash();
+        let peers = self.peers().await?;
+        
+        for peer in peers.0 {
+            let hanshake_message = HandshakeMessage::new(
+                String::from("00112233445566778899"),
+                info_hash,
+                 None
+            );
+            let mut con = tokio::time::timeout(
+                Duration::from_secs(30), 
+                TcpStream::connect(peer)
+            ).await??;
+
+            let message: BytesMut = hanshake_message.into();
+            loop {
+                con.writable().await?;
+                match con.try_write(message.as_ref()) {
+                    Result::Ok(_) => {
+                        break;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        continue;
+                    }
+                    Err(error) => {
+                        return Result::Err(Error::msg(error));
+                    }
+                }
+            }
+
+            let mut read_buf = [0u8; 1];
+            loop {
+                con.readable().await?;
+                match con.try_read(&mut read_buf) {
+                    Result::Ok(_) => break,
+                    Err(_) => continue,
+                }
+            }
+            if let Some(handshake_protocol_id_length) = read_buf.first() {
+                let handshake_first_byte = *handshake_protocol_id_length;
+                let handshake_length = handshake_first_byte as usize + 50;
+                println!("Peer {}, Handshake response length: {}", peer, handshake_length);
+
+                let mut buf = Vec::with_capacity(handshake_length);
+                buf.push(handshake_first_byte);
+                con.read_buf(&mut buf).await?;
+                if !buf.is_empty() {
+                    let response_handshake = HandshakeMessage::try_from(buf)?;
+                    println!(
+                        "[{0}:{1}] handshake response received: {2:?}",
+                        peer.ip(),
+                        peer.port(),
+                        response_handshake
+                    );
+                    
+                    if response_handshake.info_hash.as_slice() != info_hash.as_slice() {
+                        println!("{0:?} != {1:?}", info_hash, response_handshake.info_hash);
+                        return Result::Err(Error::msg("Invalid response"));
+                    }
+
+                    println!("[{0}:{1}] handshake is valid", peer.ip(), peer.port());
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[allow(dead_code)]
@@ -178,175 +304,25 @@ async fn main() -> Result<(), Error> {
         }
         Command::Peers { torrent } => {
             let t = parse_torrent(torrent)?;
-            let hash_info: [u8; 20] = t.info_hash();
-            let hash_info_encoded = urlencode(&hash_info);
-
-            let tracker_request = TrackerRequest {
-                peer_id: String::from("00112233445566778899"),
-                port: 6881,
-                uploaded: 0,
-                downloaded: 0,
-                left: t.info.plength,
-                compact: 1,
-            };
-
-            let url_params = serde_urlencoded::to_string(&tracker_request).context("paramaters")?;
-            let tracker_url = format!(
-                "{}?{}&info_hash={}",
-                t.announce, url_params, hash_info_encoded
-            );
-            let url = Url::parse(&tracker_url).expect("Parsing URL");
-            let response = reqwest::get(url).await?.bytes().await?;
-            let tracker_response: TrackerResponse =
-                serde_bencode::from_bytes(&response).context("Parsing tracker response")?;
-            for peer in tracker_response.peers.0 {
+            let torrent_client= TorrentClient{torrent: t};
+            let peers = torrent_client.peers().await?;
+            for peer in peers.0 {
                 println!("{}:{}", peer.ip(), peer.port())
             }
+            Ok(())
+        },
+        Command::Handshake { torrent } => {
+            let t = parse_torrent(torrent)?;
+            let info_hash = t.info_hash();
+            let torrent_client = TorrentClient{torrent: t};
+            torrent_client.handshake().await?;
             Ok(())
         }
     }
 }
 
-fn urlencode(t: &[u8; 20]) -> String {
-    let mut encoded = String::with_capacity(3 * t.len());
-    for &byte in t {
-        encoded.push('%');
-        encoded.push_str(&hex::encode(&[byte]));
-    }
-    encoded
-}
 
 fn parse_torrent(path: PathBuf) -> Result<Torrent, Error> {
     let torrent_file = std::fs::read(path).unwrap();
     return Ok(serde_bencode::from_bytes::<Torrent>(&torrent_file)?);
-}
-
-mod peers {
-    use serde::de::{self, Deserialize, Deserializer, Visitor};
-
-    use serde::ser::{Serialize, Serializer};
-
-    use std::fmt;
-
-    use std::net::{Ipv4Addr, SocketAddrV4};
-    #[derive(Debug, Clone)]
-
-    pub struct Peers(pub Vec<SocketAddrV4>);
-    struct PeersVisitor;
-
-    impl<'de> Visitor<'de> for PeersVisitor {
-        type Value = Peers;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("6 bytes, the first 4 bytes are ip address and last 2 is the port")
-        }
-
-        fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            if v.len() % 6 != 0 {
-                return Err(E::custom("Failed to parse ip address"));
-            }
-            let x = v
-                .chunks_exact(6)
-                .map(|slice_of| {
-                    let ipv4 = Ipv4Addr::new(slice_of[0], slice_of[1], slice_of[2], slice_of[3]);
-                    let port = u16::from_be_bytes([slice_of[4], slice_of[5]]);
-                    SocketAddrV4::new(ipv4, port)
-                })
-                .collect();
-
-            std::result::Result::Ok(Peers(x))
-        }
-    }
-
-    impl<'de> Deserialize<'de> for Peers {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            deserializer.deserialize_bytes(PeersVisitor)
-        }
-    }
-
-    impl Serialize for Peers {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            let mut single_slice = Vec::with_capacity(6 * self.0.len());
-            for peer in &self.0 {
-                single_slice.extend(peer.ip().octets());
-                single_slice.extend(peer.port().to_be_bytes());
-            }
-            serializer.serialize_bytes(&single_slice)
-        }
-    }
-}
-
-mod hashes {
-
-    use serde::{
-        de::{self, Deserialize, Deserializer, Visitor},
-        ser::{Serialize, Serializer},
-    };
-
-    use std::fmt;
-
-    #[derive(Debug, Clone)]
-
-    pub struct Hashes(pub Vec<[u8; 20]>);
-
-    struct HashesVisitor;
-
-    impl Hashes {
-        // fn to_sha1(&self) {
-        //     return sha1::hash(self.0.to_vec());
-        // }
-    }
-
-    impl<'de> Visitor<'de> for HashesVisitor {
-        type Value = Hashes;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("a byte string whose length is a multiple of 20")
-        }
-
-        fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            if v.len() % 20 != 0 {
-                return Err(E::custom(format!("length is {}", v.len())));
-            }
-
-            // TODO: use array_chunks when stable
-
-            Ok(Hashes(
-                v.chunks_exact(20)
-                    .map(|slice_20| slice_20.try_into().expect("guaranteed to be length 20"))
-                    .collect(),
-            ))
-        }
-    }
-
-    impl<'de> Deserialize<'de> for Hashes {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            deserializer.deserialize_bytes(HashesVisitor)
-        }
-    }
-
-    impl Serialize for Hashes {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            let single_slice = self.0.concat();
-            serializer.serialize_bytes(&single_slice)
-        }
-    }
 }

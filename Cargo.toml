@@ -35,3 +35,4 @@ tempfile = "3"                                                     # creating te
 thiserror = "1.0.38"                                               # error handling
 tokio = { version = "1.23.0", features = ["full"] }                # async http requests
 hashes = "0.1.9"                                                   # hashing
+async-trait = "0.1.74"
