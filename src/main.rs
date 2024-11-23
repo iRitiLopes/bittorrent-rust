@@ -1,14 +1,20 @@
 use anyhow::{Context, Error, Ok};
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use clap::{self, Parser};
 use cli::{Args, Command};
+use futures_util::{SinkExt, StreamExt};
+use sha1::{Digest, Sha1};
+use tokio_util::codec::{Decoder, Encoder};
 use core::str;
+use std::char::MAX;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
+use std::sync::Arc;
 use peers::Peers;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{self};
-use sha1::digest::typenum::bit;
-use std::{io, net::SocketAddrV4, path::PathBuf, sync::Arc, time::Duration, vec};
+use std::{io, net::SocketAddrV4, path::PathBuf, time::Duration, vec};
 use tokio::net::TcpStream;
 use tokio::{io::AsyncReadExt, sync::Mutex};
 use torrent::{Keys, Torrent};
@@ -21,6 +27,8 @@ mod hs;
 mod peers;
 mod torrent;
 mod transport;
+
+const MAX_BLOCK_SIZE: u32 = 1 << 14;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrackerRequest {
@@ -120,10 +128,13 @@ impl HandshakeMessage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct PeerState {
+pub struct Message {
     message_id: MessageId,
-    bitfield: Option<Vec<u8>>,
+    payload: Option<Vec<u8>>,
 }
+
+pub struct MessageFramer;
+
 
 #[derive(Debug, Clone, Deserialize)]
 enum MessageId {
@@ -135,13 +146,17 @@ enum MessageId {
     Bitfield = 5,
     Request = 6,
     Piece = 7,
-    Cancel = 8
+    Cancel = 8,
 }
 
-impl From<PeerState> for BytesMut {
-    fn from(value: PeerState) -> Self {
+impl From<Message> for BytesMut {
+    fn from(value: Message) -> Self {
         let mut result = BytesMut::new();
-        result.put_u32(1);
+        if let Some(payload) = &value.payload {
+            result.put_u32(1 + payload.len() as u32);
+        } else {
+            result.put_u32(1);
+        }
         match value.message_id {
             MessageId::Choked => result.put_u8(0),
             MessageId::Unchoked => result.put_u8(1),
@@ -153,15 +168,110 @@ impl From<PeerState> for BytesMut {
             MessageId::Piece => result.put_u8(7),
             MessageId::Cancel => result.put_u8(8),
         }
+        if let Some(payload) = value.payload {
+            for bit in payload {
+                result.put_u8(bit);
+            }
+        }
+
         result
     }
 }
 
-impl PeerState {
+impl Decoder for MessageFramer {
+    type Item = Message;
+
+    type Error = Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        println!("INCOMING BYTES LEN {}", src.len());
+        if src.len() < 4 {
+            return Ok(None);
+        }
+
+        let mut length_bytes = [0u8; 4];
+        length_bytes.copy_from_slice(&src[..4]);
+        let length = u32::from_be_bytes(length_bytes) as usize;
+        println!("INCOMING LENGTH BYTES LEN {}", length);
+
+        if length == 0 {
+            println!("Advancing 4");
+            src.advance(4);
+            return self.decode(src);
+        }
+
+        if src.len() < 5 {
+            return Ok(None);
+        }
+
+        if length > MAX_BLOCK_SIZE as usize {
+            //panic!("Frame of length {} is too large.", length);
+        }
+
+        if src.len() < 4 + length {
+            src.reserve(4 + length - src.len());
+            return Ok(None);
+        }
+
+        let tag = match src[4] {
+            0 => MessageId::Choked,
+            1 => MessageId::Unchoked,
+            2 => MessageId::Interested,
+            3 => MessageId::NotInterested,
+            4 => MessageId::Have,
+            5 => MessageId::Bitfield,
+            6 => MessageId::Request,
+            7 => MessageId::Piece,
+            8 => MessageId::Cancel,
+            _ => {
+                return Err(Error::msg("a"));
+            }
+        };
+
+        let data = if src.len() > 5 {
+            src[5..4 + length].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        src.advance(4 + length);
+        
+        Ok(Some(Message{message_id: tag, payload: Some(data)}))
+    }
+}
+
+impl Encoder<Message> for MessageFramer {
+    type Error = Error;
+
+    fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        // Don't send a message if it is longer than the other end will
+        // accept.
+        if let Some(payload) = item.payload {
+            if payload.len() + 1 > MAX_BLOCK_SIZE as usize {
+                return Err(Error::msg("a"));
+            }
+    
+            // Convert the length into a byte array.
+            let len_slice = u32::to_be_bytes(payload.len() as u32 + 1);
+    
+            // Reserve space in the buffer.
+            dst.reserve(4 /* length */ + 1 /* tag */ + payload.len());
+    
+            // Write the length and string to the buffer.
+            dst.extend_from_slice(&len_slice);
+            dst.put_u8(item.message_id as u8);
+            dst.extend_from_slice(&payload);
+        }
+        
+        Ok(())
+    }
+}
+
+impl Message {
     fn new() -> Self {
-        PeerState {
+        Message {
             message_id: MessageId::Choked,
-            bitfield: None,
+            payload: None,
         }
     }
 
@@ -169,21 +279,50 @@ impl PeerState {
         let byte_index = piece_index / 8;
         let bit_index = 7 - (piece_index % 8);
 
-
-        if let Some(bitfield) = &self.bitfield {
+        if let Some(bitfield) = &self.payload {
             if byte_index >= bitfield.len() {
                 return false; // Out of range
             }
             (bitfield[byte_index] >> bit_index) & 1 == 1
         } else {
-            return false
+            return false;
         }
+    }
+}
+
+#[repr(C)]
+#[repr(packed)]
+pub struct Request {
+    index: [u8; 4],
+    begin: [u8; 4],
+    length: [u8; 4],
+}
+
+impl Request {
+    pub fn new(index: u32, begin: u32, length: u32) -> Self {
+        Self {
+            index: index.to_be_bytes(),
+            begin: begin.to_be_bytes(),
+            length: length.to_be_bytes(),
+        }
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        println!("index: {} - begin: {} - length: {}", u32::from_be_bytes(self.index), u32::from_be_bytes(self.begin), u32::from_be_bytes(self.length));
+        let bytes = self as *mut Self as *mut [u8; std::mem::size_of::<Self>()];
+        // Safety: Self is a POD with repr(c) and repr(packed)
+        let bytes: &mut [u8; std::mem::size_of::<Self>()] = unsafe { &mut *bytes };
+        bytes
     }
 }
 
 #[derive(Clone)]
 struct TorrentClient {
     pub torrent: Torrent,
+}
+
+struct PieceProgress {
+    total: usize
 }
 
 impl TorrentClient {
@@ -206,6 +345,7 @@ impl TorrentClient {
         );
         let url = Url::parse(&tracker_url).expect("Parsing URL");
         let response = reqwest::get(url).await?.bytes().await?;
+        println!("{:?}", response);
         let tracker_response: TrackerResponse =
             serde_bencode::from_bytes(&response).context("Parsing tracker response")?;
         Ok(tracker_response)
@@ -269,9 +409,9 @@ impl TorrentClient {
     }
 
     async fn send_interested(con: &mut TcpStream) -> Result<(), Error> {
-        let interested = PeerState {
+        let interested = Message {
             message_id: MessageId::Interested,
-            bitfield: None,
+            payload: None,
         };
         con.writable().await?;
         let message: BytesMut = interested.into();
@@ -280,9 +420,9 @@ impl TorrentClient {
     }
 
     async fn send_unchoke(con: &mut TcpStream) -> Result<(), Error> {
-        let interested = PeerState {
+        let interested = Message {
             message_id: MessageId::Unchoked,
-            bitfield: None,
+            payload: None,
         };
         con.writable().await?;
         let message: BytesMut = interested.into();
@@ -290,13 +430,62 @@ impl TorrentClient {
         Ok(())
     }
 
-    pub async fn attempt_download(con: &mut TcpStream, index: usize) {
+    pub async fn attempt_download(con: &mut TcpStream, index: usize, torrent: &Torrent, file: &mut File) -> Result<(), Error> {
+        let piece_length = torrent.info.plength as u32;
+        let mut downloaded_piece_data = 0u32;
+        let mut data = BytesMut::with_capacity(torrent.info.plength);
+        let mut peer = tokio_util::codec::Framed::new(con, MessageFramer);
+
+        while downloaded_piece_data < piece_length {
+            let mut block_size = MAX_BLOCK_SIZE;
+            if piece_length - downloaded_piece_data < MAX_BLOCK_SIZE {
+                block_size = piece_length - downloaded_piece_data
+            }
+
+            let mut req_payload = Request::new(index as u32, downloaded_piece_data, block_size);
+            println!("Request block piece: {} - begin: {} - length: {}", index, downloaded_piece_data, block_size);
+            let request = Message {
+                message_id: MessageId::Request,
+                payload: Some(Vec::from(req_payload.as_bytes_mut())),
+            };
+
+            peer.send(request).await?;
+
+            let piece = peer
+                .next()
+                .await
+                .expect("peer always send a piece")
+                .context("peer message is invalid")?;
+
+            if let Some(piece) = piece.payload {
+                let mut b = BytesMut::with_capacity(piece.len());
+                b.extend_from_slice(&piece);
+                println!("Download block of piece {} - length: {}", index, piece.len());
+                println!("Downloaded block: {:?}", b);
+                data.extend_from_slice(&piece);
+            }
+            
+            downloaded_piece_data += block_size
+        }
+
+        let mut hasher = Sha1::new();
+            hasher.update(&data);
+            let hash: [u8; 20] = hasher
+                .finalize()
+                .try_into()
+                .expect("GenericArray<_, 20> == [_; 20]");
         
+        // if &hash != &torrent.info.pieces.0[index] {
+        //     panic!("Hashs not matching {:?} == {:?}", hash, torrent.info.pieces.0[index])
+        // }
+        println!("Writing piece starting from {} - length: {}", index as u64 * piece_length as u64, data.len());
+        file.write_all_at(&data, index as u64 * piece_length as u64)?;
+        Ok(())
     }
 
     pub async fn new(&self, peer: SocketAddrV4) -> Result<(), Error> {
-        let mut con =
-            tokio::time::timeout(Duration::from_secs(30), TcpStream::connect(peer)).await??;
+        let timeout = Duration::from_secs(30);
+        let mut con = tokio::time::timeout(timeout, TcpStream::connect(peer)).await??;
 
         println!("Handshaking {:?}", peer);
         if let Err(error) = self.handshake(&mut con).await {
@@ -318,14 +507,28 @@ impl TorrentClient {
 
         println!("Pieces hashes: {:?}", self.torrent.info.pieces.clone());
 
-        for (i, _) in self.torrent.info.pieces.0.iter().enumerate() {
-            println!("Peer contain piece of index {} -> {}", i, peer_state.has_piece(i))
+        let peer_pieces = self
+            .torrent
+            .info
+            .pieces
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| peer_state.has_piece(*idx));
+
+        let mut file = File::create(&self.torrent.info.name)?;
+        let file_size: u64 = self.torrent.info.plength as u64 * self.torrent.info.pieces.0.len() as u64;
+        file.set_len(file_size)?;
+
+        for (i, _) in peer_pieces {
+            println!("Attempting to download the piece {}", i);
+            TorrentClient::attempt_download(&mut con, i, &self.torrent, &mut file).await?;
         }
         println!("-----------------");
         Ok(())
     }
 
-    async fn process(con: &mut TcpStream) -> Result<PeerState, Error> {
+    async fn process(con: &mut TcpStream) -> Result<Message, Error> {
         loop {
             let mut length_buf = [0u8; 4];
             con.readable().await?;
@@ -341,17 +544,17 @@ impl TorrentClient {
 
             match message_buf[0] {
                 1 => {
-                    return Ok(PeerState {
+                    return Ok(Message {
                         message_id: MessageId::Unchoked,
-                        bitfield: None,
+                        payload: None,
                     })
                 }
                 5 => {
                     let mut bitfield = Vec::new();
                     bitfield.push(message_buf[1]);
-                    return Ok(PeerState {
+                    return Ok(Message {
                         message_id: MessageId::Unchoked,
-                        bitfield: Some(bitfield),
+                        payload: Some(bitfield),
                     });
                 }
                 a => println!("Received unknown message {}", a),
@@ -432,12 +635,14 @@ async fn main() -> Result<(), Error> {
         Command::Info { torrent } => {
             let t = parse_torrent(torrent)?;
             println!("Tracker URL: {}", t.announce);
-            match t.info.keys {
+            match &t.info.keys {
                 Keys::SingleFile { length } => {
                     println!("Length: {length}");
                 }
-                Keys::MultiFile { files: _ } => {
-                    todo!()
+                Keys::MultiFile { files } => {
+                    for (idx, f) in files.iter().enumerate() {
+                        println!("File #{}: length {}", idx, f.length)
+                    }
                 }
             };
             let hash_info: String = hex::encode(t.info_hash());
@@ -463,9 +668,10 @@ async fn main() -> Result<(), Error> {
             let peers = TorrentClient::peers(t.clone()).await?;
 
             let torrent_client = TorrentClient { torrent: t };
-            for peer in peers.peers.0 {
+            let peer = peers.peers.0[0];
+            //for peer in peers.peers.0 {
                 torrent_client.clone().new(peer).await?;
-            }
+            //}
             Ok(())
         }
     }
