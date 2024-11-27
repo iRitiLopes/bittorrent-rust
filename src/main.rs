@@ -8,25 +8,18 @@ use peers::Peers;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{self};
-use sha1::{Digest, Sha1};
-use std::char::MAX;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::sync::Arc;
-use std::{io, net::SocketAddrV4, path::PathBuf, time::Duration, vec};
+use std::{io, net::SocketAddrV4, path::PathBuf, time::Duration};
 use tokio::net::TcpStream;
-use tokio::{io::AsyncReadExt, sync::Mutex};
+use tokio::io::AsyncReadExt;
 use tokio_util::codec::{Decoder, Encoder};
 use torrent::{Keys, Torrent};
-use transport::Transport;
-// Available if you need it!
-// use serde_bencode
 
 mod cli;
 mod hs;
 mod peers;
 mod torrent;
-mod transport;
 
 const MAX_BLOCK_SIZE: u32 = 1 << 14;
 
@@ -84,32 +77,13 @@ impl TryFrom<Vec<u8>> for HandshakeMessage {
             [protocol_id_length + 8..protocol_id_length + SHA1_HASH_BYTE_LENGTH + 8]
             .try_into()
             .map_err(|_| Error::msg("Failed"))?;
-        let reserved: [u8; 8] = message[protocol_id_length..protocol_id_length + 8]
-            .try_into()
-            .map_err(|_| Error::msg("Failed"))?;
+
         let peer_id = &message[protocol_id_length + SHA1_HASH_BYTE_LENGTH + 8..];
         Ok(Self::new(
             String::from_utf8_lossy(peer_id).to_string(),
             info_hash,
             Some(String::from_utf8_lossy(protocol_id).to_string()),
         ))
-    }
-}
-
-pub struct PeerConnection<S>
-where
-    S: Transport,
-{
-    stream: Arc<Mutex<S>>,
-    io_timeout: Duration,
-}
-
-impl<T: Transport> PeerConnection<T> {
-    pub fn new(stream: T, io_timeout: Duration) -> Self {
-        Self {
-            stream: Arc::new(Mutex::new(stream)),
-            io_timeout,
-        }
     }
 }
 
@@ -184,7 +158,6 @@ impl Decoder for MessageFramer {
     type Error = Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        println!("INCOMING BYTES LEN {}", src.len());
         if src.len() < 4 {
             return Ok(None);
         }
@@ -192,10 +165,8 @@ impl Decoder for MessageFramer {
         let mut length_bytes = [0u8; 4];
         length_bytes.copy_from_slice(&src[..4]);
         let length = u32::from_be_bytes(length_bytes) as usize;
-        println!("INCOMING LENGTH BYTES LEN {}", length);
 
         if length == 0 {
-            println!("Advancing 4");
             src.advance(4);
             return self.decode(src);
         }
@@ -271,13 +242,6 @@ impl Encoder<Message> for MessageFramer {
 }
 
 impl Message {
-    fn new() -> Self {
-        Message {
-            message_id: MessageId::Choked,
-            payload: None,
-        }
-    }
-
     fn has_piece(&self, piece_index: usize) -> bool {
         let byte_index = piece_index / 8;
         let bit_index = 7 - (piece_index % 8);
@@ -367,10 +331,6 @@ struct TorrentClient {
     pub torrent: Torrent,
 }
 
-struct PieceProgress {
-    total: usize,
-}
-
 impl TorrentClient {
     pub async fn peers(torrent: Torrent) -> Result<TrackerResponse, Error> {
         let hash_info_encoded = torrent.url_encoded();
@@ -454,42 +414,13 @@ impl TorrentClient {
         Ok(())
     }
 
-    async fn send_interested(con: &mut TcpStream) -> Result<(), Error> {
-        let interested = Message {
-            message_id: MessageId::Interested,
-            payload: None,
-        };
-        con.writable().await?;
-        let message: BytesMut = interested.into();
-        con.try_write(message.as_ref())?;
-        Ok(())
-    }
-
-    async fn send_unchoke(con: &mut TcpStream) -> Result<(), Error> {
-        let interested = Message {
-            message_id: MessageId::Unchoked,
-            payload: None,
-        };
-        con.writable().await?;
-        let message: BytesMut = interested.into();
-        con.try_write(message.as_ref())?;
-        Ok(())
-    }
-
-    pub async fn attempt_download2(
+    pub async fn attempt_download(
         con: &mut TcpStream,
         index: usize,
         torrent: &Torrent,
         file: &mut File,
     ) -> Result<(), Error> {
         let mut peer = tokio_util::codec::Framed::new(con, MessageFramer);
-
-        let unchoke = peer
-                .next()
-                .await
-                .expect("peer always sends an unchoke")
-                .context("peer message was invalid")?;
-            assert_eq!(unchoke.message_id, MessageId::Unchoked);
 
         let length = if let torrent::Keys::SingleFile { length } = torrent.info.keys {
             length
@@ -548,88 +479,13 @@ impl TorrentClient {
                 assert_eq!(piece.index() as usize, index);
                 assert_eq!(piece.begin() as usize, block * MAX_BLOCK_SIZE as usize);
                 assert_eq!(piece.block().len(), block_size);
+                println!("Piece size downloaded: {}", piece.block().len());
                 all_blocks.extend(piece.block());
             }
         }
 
-        println!("{:?}", all_blocks);
+        file.write_all_at(&all_blocks, index as u64 * piece_size as u64)?;
 
-        Ok(())
-    }
-
-    pub async fn attempt_download(
-        con: &mut TcpStream,
-        index: usize,
-        torrent: &Torrent,
-        file: &mut File,
-    ) -> Result<(), Error> {
-        let piece_length = torrent.info.plength as u32;
-        let mut downloaded_piece_data = 0u32;
-        let mut data = BytesMut::with_capacity(torrent.info.plength);
-        let mut peer: tokio_util::codec::Framed<&mut TcpStream, MessageFramer> = tokio_util::codec::Framed::new(con, MessageFramer);
-
-        let unchoke = peer
-                .next()
-                .await
-                .expect("peer always sends an unchoke")
-                .context("peer message was invalid")?;
-            assert_eq!(unchoke.message_id, MessageId::Unchoked);
-
-        while downloaded_piece_data < piece_length {
-            let mut block_size = MAX_BLOCK_SIZE;
-            if piece_length - downloaded_piece_data < MAX_BLOCK_SIZE {
-                block_size = piece_length - downloaded_piece_data
-            }
-
-            let mut req_payload = Request::new(index as u32, downloaded_piece_data, block_size);
-            println!(
-                "Request block piece: {} - begin: {} - length: {}",
-                index, downloaded_piece_data, block_size
-            );
-            let request = Message {
-                message_id: MessageId::Request,
-                payload: Some(Vec::from(req_payload.as_bytes_mut())),
-            };
-
-            peer.send(request).await?;
-
-            let piece = peer
-                .next()
-                .await
-                .expect("peer always send a piece")
-                .context("peer message is invalid")?;
-
-            if let Some(piece) = piece.payload {
-                let mut b = BytesMut::with_capacity(piece.len());
-                b.extend_from_slice(&piece);
-                println!(
-                    "Download block of piece {} - length: {}",
-                    index,
-                    piece.len()
-                );
-                println!("Downloaded block: {:?}", b);
-                data.extend_from_slice(&piece);
-            }
-
-            downloaded_piece_data += block_size
-        }
-
-        let mut hasher = Sha1::new();
-        hasher.update(&data);
-        let hash: [u8; 20] = hasher
-            .finalize()
-            .try_into()
-            .expect("GenericArray<_, 20> == [_; 20]");
-
-        // if &hash != &torrent.info.pieces.0[index] {
-        //     panic!("Hashs not matching {:?} == {:?}", hash, torrent.info.pieces.0[index])
-        // }
-        println!(
-            "Writing piece starting from {} - length: {}",
-            index as u64 * piece_length as u64,
-            data.len()
-        );
-        file.write_all_at(&data, index as u64 * piece_length as u64)?;
         Ok(())
     }
 
@@ -642,20 +498,23 @@ impl TorrentClient {
             panic!("Failed to handshake {}", error);
         }
 
-        println!("Sending Unchoke to peer {:?}", peer);
-        if let Err(_) = TorrentClient::send_unchoke(&mut con).await {
-            panic!("Failed to interest torrent");
-        }
+        let mut peer_connection = tokio_util::codec::Framed::new(&mut con, MessageFramer);
+        let bitfield = peer_connection
+                .next()
+                .await
+                .expect("peer always sends an bitfield")
+                .context("peer message was invalid")?;
+        println!("Bitfield {:?}", bitfield.message_id);
+        assert_eq!(bitfield.message_id, MessageId::Bitfield);
 
-        println!("Sending interesting to peer {:?}", peer);
-        if let Err(_) = TorrentClient::send_interested(&mut con).await {
-            panic!("Failed to interest torrent");
-        }
-
-        let peer_state = TorrentClient::process(&mut con).await?;
-        println!("Peer {:?} of peer: {:?}", peer_state, peer);
-
-        println!("Pieces hashes: {:?}", self.torrent.info.pieces.clone());
+        peer_connection.send(Message { message_id: MessageId::Interested, payload: Some(Vec::new()) }).await?;
+        let unchoked = peer_connection
+                .next()
+                .await
+                .expect("peer always sends an unchoke")
+                .context("peer message was invalid")?;
+        println!("Unchoked {:?}", unchoked.message_id);
+        assert_eq!(unchoked.message_id, MessageId::Unchoked);
 
         let peer_pieces = self
             .torrent
@@ -664,53 +523,21 @@ impl TorrentClient {
             .0
             .iter()
             .enumerate()
-            .filter(|(idx, _)| peer_state.has_piece(*idx));
+            .filter(|(idx, _)| bitfield.has_piece(*idx));
 
         let mut file = File::create(&self.torrent.info.name)?;
-        let file_size: u64 =
-            self.torrent.info.plength as u64 * self.torrent.info.pieces.0.len() as u64;
-        file.set_len(file_size)?;
+        if let Keys::SingleFile { length } = self.torrent.info.keys {
+            println!("Creating file {} with size {}", self.torrent.info.name, length);
+            //file.set_len(length as u64)?;
+        }
 
         for (i, _) in peer_pieces {
             println!("Attempting to download the piece {}", i);
             TorrentClient::attempt_download(&mut con, i, &self.torrent, &mut file).await?;
         }
         println!("-----------------");
+        file.sync_all()?;
         Ok(())
-    }
-
-    async fn process(con: &mut TcpStream) -> Result<Message, Error> {
-        loop {
-            let mut length_buf = [0u8; 4];
-            con.readable().await?;
-            con.try_read(&mut length_buf)?;
-
-            let message_length = u32::from_be_bytes(length_buf);
-            if message_length == 0 {
-                // Keep-alive message
-                continue;
-            }
-            let mut message_buf: Vec<u8> = Vec::with_capacity(message_length as usize);
-            con.read_buf(&mut message_buf).await?;
-
-            match message_buf[0] {
-                1 => {
-                    return Ok(Message {
-                        message_id: MessageId::Unchoked,
-                        payload: None,
-                    })
-                }
-                5 => {
-                    let mut bitfield = Vec::new();
-                    bitfield.push(message_buf[1]);
-                    return Ok(Message {
-                        message_id: MessageId::Unchoked,
-                        payload: Some(bitfield),
-                    });
-                }
-                a => println!("Received unknown message {}", a),
-            }
-        }
     }
 }
 
@@ -819,10 +646,10 @@ async fn main() -> Result<(), Error> {
             let peers = TorrentClient::peers(t.clone()).await?;
 
             let torrent_client = TorrentClient { torrent: t };
-            let peer = peers.peers.0[0];
-            //for peer in peers.peers.0 {
-            torrent_client.clone().new(peer).await?;
-            //}
+            for peer in peers.peers.0 {
+                println!("Downloading from Peer {}", peer);
+                torrent_client.clone().new(peer).await?;
+            }
             Ok(())
         }
     }
